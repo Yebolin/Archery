@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
 import base64
 import simplejson as json
+import psycopg2
 
 from decimal import Decimal
 from datetime import datetime, date, timedelta
@@ -9,6 +10,8 @@ from ipaddress import IPv4Address, IPv6Address
 from uuid import UUID
 from bson.objectid import ObjectId
 from bson.timestamp import Timestamp
+from bson.decimal128 import Decimal128
+from bson.regex import Regex
 
 
 @singledispatch
@@ -71,6 +74,16 @@ def _(o):
     return str(o)
 
 
+@convert.register(Decimal128)
+def _(o):
+    return str(o)
+
+
+@convert.register(Regex)
+def _(o):
+    return str(o)
+
+
 class ExtendJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         try:
@@ -82,7 +95,9 @@ class ExtendJSONEncoder(json.JSONEncoder):
 class ExtendJSONEncoderFTime(json.JSONEncoder):
     def default(self, obj):
         try:
-            if isinstance(obj, datetime):
+            if isinstance(obj, psycopg2._range.DateTimeTZRange):
+                return obj.lower.isoformat(" ") + "--" + obj.upper.isoformat(" ")
+            elif isinstance(obj, datetime):
                 return obj.isoformat(" ")
             else:
                 return convert(obj)

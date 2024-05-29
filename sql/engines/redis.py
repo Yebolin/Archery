@@ -29,29 +29,29 @@ class RedisEngine(EngineBase):
             return redis.cluster.RedisCluster(
                 host=self.host,
                 port=self.port,
-                password=self.password,
+                username=self.user,
+                password=self.password or None,
                 encoding_errors="ignore",
                 decode_responses=True,
                 socket_connect_timeout=10,
+                ssl=self.is_ssl,
             )
         else:
             return redis.Redis(
                 host=self.host,
                 port=self.port,
                 db=db_name,
-                password=self.password,
+                username=self.user,
+                password=self.password or None,
                 encoding_errors="ignore",
                 decode_responses=True,
                 socket_connect_timeout=10,
+                ssl=self.is_ssl,
             )
 
-    @property
-    def name(self):
-        return "Redis"
+    name = "Redis"
 
-    @property
-    def info(self):
-        return "Redis engine"
+    info = "Redis engine"
 
     def test_connection(self):
         return self.get_all_databases()
@@ -66,13 +66,22 @@ class RedisEngine(EngineBase):
         try:
             rows = conn.config_get("databases")["databases"]
         except Exception as e:
+            """
+            由于尝试获取databases配置失败，下面的代码块将通过解析info命令的输出来确定数据库的数量。
+            失败场景1：AWS-ElastiCache(Redis)服务不支持部分命令行。比如: config get xx, acl 部分命令
+            失败场景2：使用了没有管理员权限（-@admin）的Redis用户。 （异常信息：this user has no permissions to run the 'config' command or its subcommand）
+            步骤：
+            - 通过info("Keyspace")获取所有的数据库键空间信息。
+            - 从键空间信息中提取数据库编号（如db0, db1等）。
+            - 计算数据库数量，至少会返回0到15共16个数据库。
+            """
             logger.warning(f"Redis CONFIG GET databases 执行报错，异常信息：{e}")
             dbs = [
                 int(i.split("db")[1])
                 for i in conn.info("Keyspace").keys()
                 if len(i.split("db")) == 2
             ]
-            rows = max(dbs + [16])
+            rows = max(dbs + [15]) + 1
 
         db_list = [str(x) for x in range(int(rows))]
         result.rows = db_list
@@ -146,7 +155,9 @@ class RedisEngine(EngineBase):
             if limit_num > 0:
                 result_set.rows = result_set.rows[0:limit_num]
         except Exception as e:
-            logger.warning(f"Redis命令执行报错，语句：{sql}， 错误信息：{traceback.format_exc()}")
+            logger.warning(
+                f"Redis命令执行报错，语句：{sql}， 错误信息：{traceback.format_exc()}"
+            )
             result_set.error = str(e)
         return result_set
 
@@ -167,7 +178,7 @@ class RedisEngine(EngineBase):
                 id=line,
                 errlevel=0,
                 stagestatus="Audit completed",
-                errormessage="None",
+                errormessage="暂不支持显示影响行数",
                 sql=cmd,
                 affected_rows=0,
                 execute_time=0,
@@ -193,7 +204,7 @@ class RedisEngine(EngineBase):
                         id=line,
                         errlevel=0,
                         stagestatus="Execute Successfully",
-                        errormessage="None",
+                        errormessage="暂不支持显示影响行数",
                         sql=cmd,
                         affected_rows=0,
                         execute_time=t.cost,

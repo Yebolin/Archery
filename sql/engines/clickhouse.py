@@ -1,5 +1,6 @@
 # -*- coding: UTF-8 -*-
 from clickhouse_driver import connect
+from clickhouse_driver.util.escape import escape_chars_map
 from sql.utils.sql_utils import get_syntax_type
 from .models import ResultSet, ReviewResult, ReviewSet
 from common.utils.timer import FuncTimer
@@ -41,13 +42,12 @@ class ClickHouseEngine(EngineBase):
             )
         return self.conn
 
-    @property
-    def name(self):
-        return "ClickHouse"
+    name = "ClickHouse"
+    info = "ClickHouse engine"
 
-    @property
-    def info(self):
-        return "ClickHouse engine"
+    def escape_string(self, value: str) -> str:
+        """字符串参数转义"""
+        return "%s" % "".join(escape_chars_map.get(c, c) for c in value)
 
     @property
     def auto_backup(self):
@@ -63,11 +63,9 @@ class ClickHouseEngine(EngineBase):
 
     def get_table_engine(self, tb_name):
         """获取某个table的engine type"""
-        sql = f"""select engine 
-                    from system.tables 
-                   where database='{tb_name.split('.')[0]}' 
-                     and name='{tb_name.split('.')[1]}'"""
-        query_result = self.query(sql=sql)
+        db, tb = tb_name.split(".")
+        sql = f"""select engine from system.tables where database=%(db)s and name=%(tb)s"""
+        query_result = self.query(sql=sql, parameters={"db": db, "tb": tb})
         if query_result.rows:
             result = {"status": 1, "engine": query_result.rows[0][0]}
         else:
@@ -104,15 +102,20 @@ class ClickHouseEngine(EngineBase):
         from
             system.columns
         where
-            database = '{db_name}'
-        and table = '{tb_name}';"""
-        result = self.query(db_name=db_name, sql=sql)
+            database = %(db_name)s
+        and table = %(tb_name)s;"""
+        result = self.query(
+            db_name=db_name,
+            sql=sql,
+            parameters={"db_name": db_name, "tb_name": tb_name},
+        )
         column_list = [row[0] for row in result.rows]
         result.rows = column_list
         return result
 
     def describe_table(self, db_name, tb_name, **kwargs):
         """return ResultSet 类似查询"""
+        tb_name = self.escape_string(tb_name)
         sql = f"show create table `{tb_name}`;"
         result = self.query(db_name=db_name, sql=sql)
 
@@ -121,13 +124,21 @@ class ClickHouseEngine(EngineBase):
         )
         return result
 
-    def query(self, db_name=None, sql="", limit_num=0, close_conn=True, **kwargs):
+    def query(
+        self,
+        db_name=None,
+        sql="",
+        limit_num=0,
+        close_conn=True,
+        parameters=None,
+        **kwargs,
+    ):
         """返回 ResultSet"""
         result_set = ResultSet(full_sql=sql)
         try:
             conn = self.get_connection(db_name=db_name)
             cursor = conn.cursor()
-            cursor.execute(sql)
+            cursor.execute(sql, parameters)
             if int(limit_num) > 0:
                 rows = cursor.fetchmany(size=int(limit_num))
             else:
@@ -244,7 +255,7 @@ class ClickHouseEngine(EngineBase):
         for statement in sql_list:
             statement = statement.rstrip(";")
             # 禁用语句
-            if re.match(r"^select|^show", statement.lower()):
+            if re.match(r"^select|^show", statement, re.M | re.IGNORECASE):
                 result = ReviewResult(
                     id=line,
                     errlevel=2,
@@ -262,11 +273,13 @@ class ClickHouseEngine(EngineBase):
                     sql=statement,
                 )
             # alter语句
-            elif re.match(r"^alter", statement.lower()):
+            elif re.match(r"^alter", statement, re.M | re.IGNORECASE):
                 # alter table语句
-                if re.match(r"^alter\s+table\s+(.+?)\s+", statement.lower()):
+                if re.match(
+                    r"^alter\s+table\s+(.+?)\s+", statement, re.M | re.IGNORECASE
+                ):
                     table_name = re.match(
-                        r"^alter\s+table\s+(.+?)\s+", statement.lower(), re.M
+                        r"^alter\s+table\s+(.+?)\s+", statement, re.M | re.IGNORECASE
                     ).group(1)
                     if "." not in table_name:
                         table_name = f"{db_name}.{table_name}"
@@ -287,7 +300,8 @@ class ClickHouseEngine(EngineBase):
                             # delete与update语句，实际是alter语句的变种
                             if re.match(
                                 r"^alter\s+table\s+(.+?)\s+(delete|update)\s+",
-                                statement.lower(),
+                                statement,
+                                re.M | re.IGNORECASE,
                             ):
                                 if not table_engine.endswith("MergeTree"):
                                     result = ReviewResult(
@@ -317,16 +331,18 @@ class ClickHouseEngine(EngineBase):
                 else:
                     result = self.explain_check(check_result, db_name, line, statement)
             # truncate语句
-            elif re.match(r"^truncate\s+table\s+(.+?)(\s|$)", statement.lower()):
+            elif re.match(
+                r"^truncate\s+table\s+(.+?)(\s|$)", statement, re.M | re.IGNORECASE
+            ):
                 table_name = re.match(
-                    r"^truncate\s+table\s+(.+?)(\s|$)", statement.lower(), re.M
+                    r"^truncate\s+table\s+(.+?)(\s|$)", statement, re.M | re.IGNORECASE
                 ).group(1)
                 if "." not in table_name:
                     table_name = f"{db_name}.{table_name}"
                 table_engine = self.get_table_engine(table_name)["engine"]
                 table_exist = self.get_table_engine(table_name)["status"]
                 if table_exist == 1:
-                    if table_engine in ("View", "File,", "URL", "Buffer", "Null"):
+                    if table_engine in ("View", "File", "URL", "Buffer", "Null"):
                         result = ReviewResult(
                             id=line,
                             errlevel=2,
@@ -347,15 +363,16 @@ class ClickHouseEngine(EngineBase):
                         sql=statement,
                     )
             # insert语句，explain无法正确判断，暂时只做表存在性检查与简单关键字匹配
-            elif re.match(r"^insert", statement.lower()):
+            elif re.match(r"^insert", statement, re.M | re.IGNORECASE):
                 if re.match(
                     r"^insert\s+into\s+([a-zA-Z_][0-9a-zA-Z_.]+)([\w\W]*?)(values|format|select)(\s+|\()",
-                    statement.lower(),
+                    statement,
+                    re.M | re.IGNORECASE,
                 ):
                     table_name = re.match(
                         r"^insert\s+into\s+([a-zA-Z_][0-9a-zA-Z_.]+)([\w\W]*?)(values|format|select)(\s+|\()",
-                        statement.lower(),
-                        re.M,
+                        statement,
+                        re.M | re.IGNORECASE,
                     ).group(1)
                     if "." not in table_name:
                         table_name = f"{db_name}.{table_name}"
@@ -462,14 +479,14 @@ class ClickHouseEngine(EngineBase):
                 break
         return execute_result
 
-    def execute(self, db_name=None, sql="", close_conn=True):
+    def execute(self, db_name=None, sql="", close_conn=True, parameters=None):
         """原生执行语句"""
         result = ResultSet(full_sql=sql)
         conn = self.get_connection(db_name=db_name)
         try:
             cursor = conn.cursor()
             for statement in sqlparse.split(sql):
-                cursor.execute(statement)
+                cursor.execute(statement, parameters)
             cursor.close()
         except Exception as e:
             logger.warning(f"ClickHouse语句执行报错，语句：{sql}，错误信息{e}")
